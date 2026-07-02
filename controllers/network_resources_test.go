@@ -98,3 +98,76 @@ func TestBuildIngress_CustomPort(t *testing.T) {
 
 	assert.Equal(t, int32(9000), ingress.Spec.Rules[0].HTTP.Paths[0].Backend.Service.Port.Number)
 }
+
+func TestBuildIngress_WithTLS(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, ogxiov1beta1.AddToScheme(scheme))
+
+	clusterInfo := &cluster.ClusterInfo{
+		DistributionImages: map[string]string{"starter": "test-image:latest"},
+	}
+
+	reconciler := controllers.NewTestReconciler(nil, scheme, clusterInfo, nil)
+
+	instance := &ogxiov1beta1.OGXServer{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-ogx",
+			Namespace: "test-ns",
+			UID:       "test-uid",
+		},
+		Spec: ogxiov1beta1.OGXServerSpec{
+			Distribution: ogxiov1beta1.DistributionSpec{Name: "starter"},
+			Network: &ogxiov1beta1.NetworkSpec{
+				TLS: &ogxiov1beta1.TLSSpec{SecretName: "my-tls-secret"},
+				ExternalAccess: &ogxiov1beta1.ExternalAccessConfig{
+					Enabled:  true,
+					Hostname: "ogx.example.com",
+				},
+			},
+		},
+	}
+
+	ingress, err := reconciler.BuildIngressForTest(instance)
+	require.NoError(t, err)
+	require.NotNil(t, ingress)
+
+	// Verify host is set on rule
+	assert.Equal(t, "ogx.example.com", ingress.Spec.Rules[0].Host)
+
+	// Verify TLS is configured
+	require.Len(t, ingress.Spec.TLS, 1)
+	assert.Equal(t, []string{"ogx.example.com"}, ingress.Spec.TLS[0].Hosts)
+	assert.Equal(t, "my-tls-secret", ingress.Spec.TLS[0].SecretName)
+}
+
+func TestBuildIngress_NoTLS(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, ogxiov1beta1.AddToScheme(scheme))
+
+	clusterInfo := &cluster.ClusterInfo{
+		DistributionImages: map[string]string{"starter": "test-image:latest"},
+	}
+
+	reconciler := controllers.NewTestReconciler(nil, scheme, clusterInfo, nil)
+
+	instance := &ogxiov1beta1.OGXServer{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-ogx",
+			Namespace: "test-ns",
+			UID:       "test-uid",
+		},
+		Spec: ogxiov1beta1.OGXServerSpec{
+			Distribution: ogxiov1beta1.DistributionSpec{Name: "starter"},
+			Network: &ogxiov1beta1.NetworkSpec{
+				ExternalAccess: &ogxiov1beta1.ExternalAccessConfig{Enabled: true},
+			},
+		},
+	}
+
+	ingress, err := reconciler.BuildIngressForTest(instance)
+	require.NoError(t, err)
+	require.NotNil(t, ingress)
+
+	// Verify no TLS configured
+	assert.Empty(t, ingress.Spec.TLS)
+}

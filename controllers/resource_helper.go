@@ -40,6 +40,11 @@ const (
 	FSGroup = int64(1001)
 	// instanceLabelKey is the label we apply to all resources for per-instance targeting.
 	instanceLabelKey = "app.kubernetes.io/instance"
+
+	TLSCertVolumeName = "tls-cert"
+	TLSCertMountPath  = "/etc/ogx/tls"
+	TLSCertFilePath   = "/etc/ogx/tls/tls.crt"
+	TLSKeyFilePath    = "/etc/ogx/tls/tls.key"
 )
 
 var (
@@ -86,6 +91,11 @@ func getManagedCABundleConfigMapName(instance *ogxiov1beta1.OGXServer) string {
 	return instance.Name + ManagedCABundleConfigMapSuffix
 }
 
+// isTLSEnabled returns true when the instance has a server TLS Secret configured.
+func isTLSEnabled(instance *ogxiov1beta1.OGXServer) bool {
+	return instance.Spec.Network != nil && instance.Spec.Network.TLS != nil && instance.Spec.Network.TLS.SecretName != ""
+}
+
 // startupScript is the script that will be used to start the server.
 var startupScript = `
 set -e
@@ -122,23 +132,37 @@ except Exception as e:
 PORT=${OGX_PORT:-8321}
 WORKERS=${OGX_WORKERS:-1}
 
+# Build TLS or insecure flags
+TLS_FLAGS=""
+INSECURE_FLAG=""
+if [ -n "${OGX_TLS_CERTFILE:-}" ] && [ -n "${OGX_TLS_KEYFILE:-}" ]; then
+    TLS_FLAGS="--ssl-certfile $OGX_TLS_CERTFILE --ssl-keyfile $OGX_TLS_KEYFILE"
+else
+    INSECURE_FLAG="--insecure"
+fi
+
 # Execute the appropriate CLI based on version
 case $VERSION_CODE in
-    0) python3 -m ogx.distribution.server.server --config /etc/ogx/config.yaml ;;
-    1) python3 -m ogx.core.server.server /etc/ogx/config.yaml ;;
-    2) exec uvicorn ogx.core.server.server:create_app --host 0.0.0.0 --port "$PORT" --workers "$WORKERS" --factory ;;
+    0) python3 -m ogx.distribution.server.server --config /etc/ogx/config.yaml $INSECURE_FLAG ;;
+    1) python3 -m ogx.core.server.server /etc/ogx/config.yaml $INSECURE_FLAG ;;
+    2) exec uvicorn ogx.core.server.server:create_app --host 0.0.0.0 --port "$PORT" --workers "$WORKERS" --factory $TLS_FLAGS $INSECURE_FLAG ;;
     *) echo "Invalid version code: $VERSION_CODE, using uvicorn CLI command"; \
-       exec uvicorn ogx.core.server.server:create_app --host 0.0.0.0 --port "$PORT" --workers "$WORKERS" --factory ;;
+       exec uvicorn ogx.core.server.server:create_app --host 0.0.0.0 --port "$PORT" --workers "$WORKERS" --factory $TLS_FLAGS $INSECURE_FLAG ;;
 esac`
 
 const ogxConfigPath = "/etc/ogx/config.yaml"
 
 // getHealthProbe returns the health probe handler for the container.
 func getHealthProbe(instance *ogxiov1beta1.OGXServer) corev1.ProbeHandler {
+	scheme := corev1.URISchemeHTTP
+	if isTLSEnabled(instance) {
+		scheme = corev1.URISchemeHTTPS
+	}
 	return corev1.ProbeHandler{
 		HTTPGet: &corev1.HTTPGetAction{
-			Path: "/v1/health",
-			Port: intstr.FromInt(int(getContainerPort(instance))),
+			Path:   "/v1/health",
+			Port:   intstr.FromInt(int(getContainerPort(instance))),
+			Scheme: scheme,
 		},
 	}
 }
@@ -275,6 +299,20 @@ func configureContainerEnvironment(ctx context.Context, r *OGXServerReconciler, 
 		})
 	}
 
+	// Inject TLS certificate paths when server TLS is enabled.
+	if isTLSEnabled(instance) {
+		container.Env = append(container.Env,
+			corev1.EnvVar{
+				Name:  "OGX_TLS_CERTFILE",
+				Value: TLSCertFilePath,
+			},
+			corev1.EnvVar{
+				Name:  "OGX_TLS_KEYFILE",
+				Value: TLSKeyFilePath,
+			},
+		)
+	}
+
 	// Always provide worker/port/config env for uvicorn; workers default to 1 when unspecified.
 	container.Env = append(container.Env,
 		corev1.EnvVar{
@@ -339,6 +377,9 @@ func configureContainerMounts(
 
 	// Add CA bundle volume mount if TLS config is specified or auto-detected
 	addCABundleVolumeMount(ctx, r, instance, container)
+
+	// Add TLS certificate volume mount for server TLS termination
+	addTLSCertVolumeMount(instance, container)
 }
 
 // hasAnyCABundle checks if any CA bundle will be mounted (explicit or auto-detected).
@@ -419,6 +460,18 @@ func addCABundleVolumeMount(ctx context.Context, r *OGXServerReconciler, instanc
 	}
 }
 
+// addTLSCertVolumeMount adds the TLS certificate volume mount to the container when TLS is enabled.
+func addTLSCertVolumeMount(instance *ogxiov1beta1.OGXServer, container *corev1.Container) {
+	if !isTLSEnabled(instance) {
+		return
+	}
+	container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{
+		Name:      TLSCertVolumeName,
+		MountPath: TLSCertMountPath,
+		ReadOnly:  true,
+	})
+}
+
 // createCABundleVolume creates the volume configuration for the managed CA bundle ConfigMap.
 func createCABundleVolume(managedConfigMapName string) corev1.Volume {
 	return corev1.Volume{
@@ -461,6 +514,9 @@ func configurePodStorage(
 
 	// Configure TLS CA bundle (with auto-detection support)
 	configureTLSCABundle(ctx, r, instance, &podSpec)
+
+	// Configure server TLS certificate volume
+	configureTLSServerCert(instance, &podSpec)
 
 	// Configure the final runtime config volume.
 	configureRuntimeConfigVolume(runtimeConfig, &podSpec)
@@ -517,6 +573,21 @@ func configureTLSCABundle(ctx context.Context, r *OGXServerReconciler, instance 
 	managedConfigMapName := getManagedCABundleConfigMapName(instance)
 	volume := createCABundleVolume(managedConfigMapName)
 	podSpec.Volumes = append(podSpec.Volumes, volume)
+}
+
+// configureTLSServerCert adds the TLS Secret volume to the pod when server TLS is enabled.
+func configureTLSServerCert(instance *ogxiov1beta1.OGXServer, podSpec *corev1.PodSpec) {
+	if !isTLSEnabled(instance) {
+		return
+	}
+	podSpec.Volumes = append(podSpec.Volumes, corev1.Volume{
+		Name: TLSCertVolumeName,
+		VolumeSource: corev1.VolumeSource{
+			Secret: &corev1.SecretVolumeSource{
+				SecretName: instance.Spec.Network.TLS.SecretName,
+			},
+		},
+	})
 }
 
 // configureRuntimeConfigVolume adds the ConfigMap volume that provides the

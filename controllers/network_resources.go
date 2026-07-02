@@ -45,6 +45,13 @@ func (r *OGXServerReconciler) buildIngress(
 	serviceName := deploy.GetServiceName(instance)
 
 	pathType := networkingv1.PathTypePrefix
+
+	ea := instance.Spec.Network.ExternalAccess
+	hostname := ""
+	if ea != nil && ea.Hostname != "" {
+		hostname = ea.Hostname
+	}
+
 	ingress := &networkingv1.Ingress{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      instance.Name + IngressNameSuffix,
@@ -57,6 +64,7 @@ func (r *OGXServerReconciler) buildIngress(
 		Spec: networkingv1.IngressSpec{
 			Rules: []networkingv1.IngressRule{
 				{
+					Host: hostname,
 					IngressRuleValue: networkingv1.IngressRuleValue{
 						HTTP: &networkingv1.HTTPIngressRuleValue{
 							Paths: []networkingv1.HTTPIngressPath{
@@ -78,6 +86,15 @@ func (r *OGXServerReconciler) buildIngress(
 				},
 			},
 		},
+	}
+
+	if isTLSEnabled(instance) && hostname != "" {
+		ingress.Spec.TLS = []networkingv1.IngressTLS{
+			{
+				Hosts:      []string{hostname},
+				SecretName: instance.Spec.Network.TLS.SecretName,
+			},
+		}
 	}
 
 	if err := ctrl.SetControllerReference(instance, ingress, r.Scheme); err != nil {
@@ -194,30 +211,37 @@ func (r *OGXServerReconciler) getIngressURL(
 		return &empty // Ingress not ready yet
 	}
 
+	tlsEnabled := isTLSEnabled(instance)
+
 	// Check for LoadBalancer ingress
 	if len(ingress.Status.LoadBalancer.Ingress) > 0 {
 		lb := ingress.Status.LoadBalancer.Ingress[0]
 		if lb.Hostname != "" {
-			return buildURLString(lb.Hostname)
+			return buildURLString(lb.Hostname, tlsEnabled)
 		}
 		if lb.IP != "" {
-			return buildURLString(lb.IP)
+			return buildURLString(lb.IP, tlsEnabled)
 		}
 	}
 
 	// Check for host in rules
 	if len(ingress.Spec.Rules) > 0 && ingress.Spec.Rules[0].Host != "" {
-		return buildURLString(ingress.Spec.Rules[0].Host)
+		return buildURLString(ingress.Spec.Rules[0].Host, tlsEnabled)
 	}
 
 	empty := ""
 	return &empty
 }
 
-// buildURLString constructs an HTTP URL from a host and returns a pointer to it.
-func buildURLString(host string) *string {
+// buildURLString constructs a URL from a host and returns a pointer to it.
+// Uses HTTPS when tlsEnabled is true, otherwise HTTP.
+func buildURLString(host string, tlsEnabled bool) *string {
+	scheme := "http"
+	if tlsEnabled {
+		scheme = "https"
+	}
 	u := &url.URL{
-		Scheme: "http",
+		Scheme: scheme,
 		Host:   host,
 	}
 	s := u.String()
