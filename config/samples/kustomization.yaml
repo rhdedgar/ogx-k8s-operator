@@ -8,3 +8,4 @@ resources:
 - example-with-generated-config.yaml
 - example-with-ca-bundle.yaml
 - example-with-network-config.yaml
+- example-with-tls.yaml

@@ -1,0 +1,158 @@
+# Example: OGXServer with server TLS + mock vLLM TLS backend
+#
+# Quick start:
+#   ./deploy-tls-test.sh
+#   (generates certs, creates secrets/configmaps, applies all resources)
+#
+# Manual setup:
+#   1. NAMESPACE=ogx-tls ./generate_certificates.sh
+#   2. kubectl create secret tls vllm-inference-tls \
+#        --cert=tls-test-certs/vllm/tls.crt --key=tls-test-certs/vllm/tls.key -n ogx-tls
+#      kubectl create secret tls ogx-server-tls \
+#        --cert=tls-test-certs/ogx-server/tls.crt --key=tls-test-certs/ogx-server/tls.key -n ogx-tls
+#   3. kubectl create configmap custom-ca-bundle \
+#        --from-file=ca-bundle.crt=tls-test-certs/ca-bundle/ca-bundle.crt -n ogx-tls
+#   4. kubectl apply -f example-with-tls.yaml -n ogx-tls
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ogx-tls-config
+data:
+  config.yaml: |
+    version: '2'
+    image_name: starter
+    apis:
+    - inference
+    providers:
+      inference:
+      - provider_id: vllm
+        provider_type: remote::vllm
+        config:
+          base_url: "https://vllm-server-tls.ogx-tls.svc.cluster.local:8000/v1"
+          max_tokens: 4096
+          api_token: "fake"
+          network:
+            tls:
+              verify: "/etc/ssl/certs/ca-bundle/ca-bundle.crt"
+    models:
+      - model_id: "Qwen/Qwen3-0.6B"
+        provider_id: vllm
+        provider_model_id: "Qwen/Qwen3-0.6B"
+        model_type: llm
+    server:
+      port: 8321
+    storage:
+      backends:
+        kv_default:
+          type: kv_sqlite
+          db_path: ${env.SQLITE_STORE_DIR:=~/.llama/distributions/starter}/kvstore.db
+        sql_default:
+          type: sql_sqlite
+          db_path: ${env.SQLITE_STORE_DIR:=~/.llama/distributions/starter}/sqlstore.db
+      stores:
+        metadata:
+          backend: kv_default
+          namespace: registry
+        inference:
+          backend: sql_default
+          table_name: inference_store
+          max_write_queue_size: 10000
+          num_writers: 4
+        conversations:
+          backend: sql_default
+          table_name: openai_conversations
+        prompts:
+          backend: kv_default
+          namespace: prompts
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-server-tls
+  labels:
+    app: vllm-server-tls
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vllm-server-tls
+  template:
+    metadata:
+      labels:
+        app: vllm-server-tls
+    spec:
+      containers:
+        - name: vllm
+          image: quay.io/dedgar/mock-vllm-tls:v0.0.6
+          imagePullPolicy: IfNotPresent
+          command: ["/app/main"]
+          env:
+            - name: CERTFILE
+              value: "/etc/vllm/tls/tls.crt"
+            - name: KEYFILE
+              value: "/etc/vllm/tls/tls.key"
+            - name: PORT
+              value: "8000"
+            - name: MODELNAME
+              value: "Qwen/Qwen3-0.6B"
+          ports:
+            - name: https
+              containerPort: 8000
+          volumeMounts:
+            - name: vllm-tls
+              mountPath: /etc/vllm/tls
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+              scheme: HTTPS
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 10
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8000
+              scheme: HTTPS
+            failureThreshold: 30
+            periodSeconds: 5
+      volumes:
+        - name: vllm-tls
+          secret:
+            secretName: vllm-inference-tls
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-server-tls
+spec:
+  selector:
+    app: vllm-server-tls
+  ports:
+    - name: https
+      port: 8000
+      targetPort: 8000
+---
+apiVersion: ogx.io/v1beta1
+kind: OGXServer
+metadata:
+  name: ogx-tls-example
+spec:
+  distribution:
+    name: starter
+  workload:
+    replicas: 1
+  network:
+    tls:
+      secretName: ogx-server-tls
+  tls:
+    trust:
+      caCertificates:
+        - configMapKeyRef:
+            name: custom-ca-bundle
+            key: ca-bundle.crt
+  overrideConfig:
+    name: ogx-tls-config
+    key: config.yaml

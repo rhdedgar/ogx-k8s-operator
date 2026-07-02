@@ -35,11 +35,16 @@ func setupTestClusterInfo(images map[string]string) *cluster.ClusterInfo {
 }
 
 func newDefaultStartupProbe(port int32) *corev1.Probe {
+	return newStartupProbeWithScheme(port, corev1.URISchemeHTTP)
+}
+
+func newStartupProbeWithScheme(port int32, scheme corev1.URIScheme) *corev1.Probe {
 	return &corev1.Probe{
 		ProbeHandler: corev1.ProbeHandler{
 			HTTPGet: &corev1.HTTPGetAction{
-				Path: "/v1/health",
-				Port: intstr.FromInt(int(port)),
+				Path:   "/v1/health",
+				Port:   intstr.FromInt(int(port)),
+				Scheme: scheme,
 			},
 		},
 		InitialDelaySeconds: startupProbeInitialDelaySeconds,
@@ -319,4 +324,159 @@ func TestBuildHPASpec(t *testing.T) {
 	require.NotNil(t, spec)
 	assert.Equal(t, int32(5), spec.MaxReplicas)
 	require.Len(t, spec.Metrics, 2)
+}
+
+func TestIsTLSEnabled(t *testing.T) {
+	tests := []struct {
+		name     string
+		instance *ogxiov1beta1.OGXServer
+		want     bool
+	}{
+		{
+			"nil network",
+			&ogxiov1beta1.OGXServer{Spec: ogxiov1beta1.OGXServerSpec{
+				Distribution: ogxiov1beta1.DistributionSpec{Image: "x"},
+			}},
+			false,
+		},
+		{
+			"nil TLS",
+			&ogxiov1beta1.OGXServer{Spec: ogxiov1beta1.OGXServerSpec{
+				Distribution: ogxiov1beta1.DistributionSpec{Image: "x"},
+				Network:      &ogxiov1beta1.NetworkSpec{},
+			}},
+			false,
+		},
+		{
+			"empty secret name",
+			&ogxiov1beta1.OGXServer{Spec: ogxiov1beta1.OGXServerSpec{
+				Distribution: ogxiov1beta1.DistributionSpec{Image: "x"},
+				Network:      &ogxiov1beta1.NetworkSpec{TLS: &ogxiov1beta1.TLSSpec{}},
+			}},
+			false,
+		},
+		{
+			"TLS enabled",
+			&ogxiov1beta1.OGXServer{Spec: ogxiov1beta1.OGXServerSpec{
+				Distribution: ogxiov1beta1.DistributionSpec{Image: "x"},
+				Network:      &ogxiov1beta1.NetworkSpec{TLS: &ogxiov1beta1.TLSSpec{SecretName: "my-tls-secret"}},
+			}},
+			true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, isTLSEnabled(tt.instance))
+		})
+	}
+}
+
+func TestHealthProbeScheme(t *testing.T) {
+	t.Run("HTTP when TLS disabled", func(t *testing.T) {
+		instance := &ogxiov1beta1.OGXServer{Spec: ogxiov1beta1.OGXServerSpec{
+			Distribution: ogxiov1beta1.DistributionSpec{Image: "x"},
+		}}
+		probe := getHealthProbe(instance)
+		assert.Equal(t, corev1.URISchemeHTTP, probe.HTTPGet.Scheme)
+	})
+
+	t.Run("HTTPS when TLS enabled", func(t *testing.T) {
+		instance := &ogxiov1beta1.OGXServer{Spec: ogxiov1beta1.OGXServerSpec{
+			Distribution: ogxiov1beta1.DistributionSpec{Image: "x"},
+			Network:      &ogxiov1beta1.NetworkSpec{TLS: &ogxiov1beta1.TLSSpec{SecretName: "tls-secret"}},
+		}}
+		probe := getHealthProbe(instance)
+		assert.Equal(t, corev1.URISchemeHTTPS, probe.HTTPGet.Scheme)
+	})
+}
+
+func TestTLSContainerEnvVars(t *testing.T) {
+	t.Run("TLS env vars present when enabled", func(t *testing.T) {
+		instance := &ogxiov1beta1.OGXServer{Spec: ogxiov1beta1.OGXServerSpec{
+			Distribution: ogxiov1beta1.DistributionSpec{Image: "x"},
+			Network:      &ogxiov1beta1.NetworkSpec{TLS: &ogxiov1beta1.TLSSpec{SecretName: "tls-secret"}},
+		}}
+		c := buildContainerSpec(t.Context(), nil, instance, "test:latest", nil, nil)
+		envMap := make(map[string]string)
+		for _, e := range c.Env {
+			envMap[e.Name] = e.Value
+		}
+		assert.Equal(t, TLSCertFilePath, envMap["OGX_TLS_CERTFILE"])
+		assert.Equal(t, TLSKeyFilePath, envMap["OGX_TLS_KEYFILE"])
+	})
+
+	t.Run("TLS env vars absent when disabled", func(t *testing.T) {
+		instance := &ogxiov1beta1.OGXServer{Spec: ogxiov1beta1.OGXServerSpec{
+			Distribution: ogxiov1beta1.DistributionSpec{Image: "x"},
+		}}
+		c := buildContainerSpec(t.Context(), nil, instance, "test:latest", nil, nil)
+		for _, e := range c.Env {
+			assert.NotEqual(t, "OGX_TLS_CERTFILE", e.Name)
+			assert.NotEqual(t, "OGX_TLS_KEYFILE", e.Name)
+		}
+	})
+}
+
+func TestTLSVolumeMount(t *testing.T) {
+	t.Run("TLS volume mount present when enabled", func(t *testing.T) {
+		instance := &ogxiov1beta1.OGXServer{Spec: ogxiov1beta1.OGXServerSpec{
+			Distribution: ogxiov1beta1.DistributionSpec{Image: "x"},
+			Network:      &ogxiov1beta1.NetworkSpec{TLS: &ogxiov1beta1.TLSSpec{SecretName: "tls-secret"}},
+		}}
+		c := buildContainerSpec(t.Context(), nil, instance, "test:latest", nil, nil)
+		var found bool
+		for _, m := range c.VolumeMounts {
+			if m.Name == TLSCertVolumeName {
+				found = true
+				assert.Equal(t, TLSCertMountPath, m.MountPath)
+				assert.True(t, m.ReadOnly)
+			}
+		}
+		assert.True(t, found, "expected TLS cert volume mount")
+	})
+
+	t.Run("TLS volume mount absent when disabled", func(t *testing.T) {
+		instance := &ogxiov1beta1.OGXServer{Spec: ogxiov1beta1.OGXServerSpec{
+			Distribution: ogxiov1beta1.DistributionSpec{Image: "x"},
+		}}
+		c := buildContainerSpec(t.Context(), nil, instance, "test:latest", nil, nil)
+		for _, m := range c.VolumeMounts {
+			assert.NotEqual(t, TLSCertVolumeName, m.Name)
+		}
+	})
+}
+
+func TestConfigureTLSServerCert(t *testing.T) {
+	t.Run("adds secret volume when TLS enabled", func(t *testing.T) {
+		instance := &ogxiov1beta1.OGXServer{Spec: ogxiov1beta1.OGXServerSpec{
+			Distribution: ogxiov1beta1.DistributionSpec{Image: "x"},
+			Network:      &ogxiov1beta1.NetworkSpec{TLS: &ogxiov1beta1.TLSSpec{SecretName: "my-tls"}},
+		}}
+		podSpec := &corev1.PodSpec{}
+		configureTLSServerCert(instance, podSpec)
+		require.Len(t, podSpec.Volumes, 1)
+		assert.Equal(t, TLSCertVolumeName, podSpec.Volumes[0].Name)
+		require.NotNil(t, podSpec.Volumes[0].Secret)
+		assert.Equal(t, "my-tls", podSpec.Volumes[0].Secret.SecretName)
+	})
+
+	t.Run("no-op when TLS disabled", func(t *testing.T) {
+		instance := &ogxiov1beta1.OGXServer{Spec: ogxiov1beta1.OGXServerSpec{
+			Distribution: ogxiov1beta1.DistributionSpec{Image: "x"},
+		}}
+		podSpec := &corev1.PodSpec{}
+		configureTLSServerCert(instance, podSpec)
+		assert.Empty(t, podSpec.Volumes)
+	})
+}
+
+func TestStartupProbeWithTLS(t *testing.T) {
+	t.Run("startup probe uses HTTPS when TLS enabled", func(t *testing.T) {
+		instance := &ogxiov1beta1.OGXServer{Spec: ogxiov1beta1.OGXServerSpec{
+			Distribution: ogxiov1beta1.DistributionSpec{Image: "x"},
+			Network:      &ogxiov1beta1.NetworkSpec{TLS: &ogxiov1beta1.TLSSpec{SecretName: "tls-secret"}},
+		}}
+		probe := getStartupProbe(instance)
+		assert.Equal(t, corev1.URISchemeHTTPS, probe.HTTPGet.Scheme)
+	})
 }

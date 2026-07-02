@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
@@ -100,8 +101,9 @@ type OGXServerReconciler struct {
 	// Image mapping overrides
 	ImageMappingOverrides map[string]string
 	// Cluster info
-	ClusterInfo *cluster.ClusterInfo
-	httpClient  *http.Client
+	ClusterInfo   *cluster.ClusterInfo
+	httpClient    *http.Client
+	httpTLSClient *http.Client
 	// OCILabelFetcher fetches OCI image labels for config resolution.
 	// When nil, OCI label resolution is disabled.
 	OCILabelFetcher config.OCILabelFetcher
@@ -985,11 +987,24 @@ func (r *OGXServerReconciler) getServerURL(instance *ogxiov1beta1.OGXServer, pat
 	serviceName := deploy.GetServiceName(instance)
 	port := deploy.GetServicePort(instance)
 
+	scheme := "http"
+	if isTLSEnabled(instance) {
+		scheme = "https"
+	}
+
 	return &url.URL{
-		Scheme: "http",
+		Scheme: scheme,
 		Host:   fmt.Sprintf("%s.%s.svc.cluster.local:%d", serviceName, instance.Namespace, port),
 		Path:   path,
 	}
+}
+
+// getHTTPClient returns the appropriate HTTP client based on TLS configuration.
+func (r *OGXServerReconciler) getHTTPClient(instance *ogxiov1beta1.OGXServer) *http.Client {
+	if isTLSEnabled(instance) {
+		return r.httpTLSClient
+	}
+	return r.httpClient
 }
 
 // getProviderInfo makes an HTTP request to the providers endpoint.
@@ -1001,7 +1016,7 @@ func (r *OGXServerReconciler) getProviderInfo(ctx context.Context, instance *ogx
 		return nil, fmt.Errorf("failed to create providers request: %w", err)
 	}
 
-	resp, err := r.httpClient.Do(req)
+	resp, err := r.getHTTPClient(instance).Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to make providers request: %w", err)
 	}
@@ -1036,7 +1051,7 @@ func (r *OGXServerReconciler) getVersionInfo(ctx context.Context, instance *ogxi
 		return "", fmt.Errorf("failed to create version request: %w", err)
 	}
 
-	resp, err := r.httpClient.Do(req)
+	resp, err := r.getHTTPClient(instance).Do(req)
 	if err != nil {
 		return "", fmt.Errorf("failed to make version request: %w", err)
 	}
@@ -1739,9 +1754,15 @@ func NewOGXServerReconciler(cachedClient client.Client, scheme *runtime.Scheme,
 		ImageMappingOverrides: imageMappingOverrides,
 		ClusterInfo:           clusterInfo,
 		httpClient:            &http.Client{Timeout: 5 * time.Second},
-		OCILabelFetcher:       ociLabelFetcher,
-		configResolver:        config.NewDefaultConfigResolver(ociLabelFetcher),
-		operatorNamespace:     operatorNamespace,
+		httpTLSClient: &http.Client{
+			Timeout: 5 * time.Second,
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: true}, //nolint:gosec // operator trusts its own managed pods
+			},
+		},
+		OCILabelFetcher:   ociLabelFetcher,
+		configResolver:    config.NewDefaultConfigResolver(ociLabelFetcher),
+		operatorNamespace: operatorNamespace,
 	}
 }
 
@@ -1830,6 +1851,7 @@ func NewTestReconciler(client client.Client, scheme *runtime.Scheme, clusterInfo
 		Scheme:                scheme,
 		ClusterInfo:           clusterInfo,
 		httpClient:            httpClient,
+		httpTLSClient:         httpClient,
 		ImageMappingOverrides: make(map[string]string),
 	}
 }

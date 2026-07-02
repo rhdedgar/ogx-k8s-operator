@@ -38,6 +38,9 @@ config/manifests/bases/llama-stack-k8s-operator.clusterserviceversion.yaml
 # Local env files for hack scripts
 hack/*.env
 
+# Generated test certificates
+config/samples/tls-test-certs/
+
 # SDD and Claude Code directories
 .claude
 .specify
