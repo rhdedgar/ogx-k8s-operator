@@ -174,7 +174,7 @@ func createCABundleConfigMap(t *testing.T, targetNS string) error {
 		return fmt.Errorf("failed to get project root: %w", err)
 	}
 
-	caBundle, err := os.ReadFile(filepath.Join(projectRoot, "config", "samples", "vllm-ca-certs", controllers.DefaultCABundleKey))
+	caBundle, err := os.ReadFile(filepath.Join(projectRoot, "config", "samples", "tls-test-certs", "ca-bundle", controllers.DefaultCABundleKey))
 	if err != nil {
 		return fmt.Errorf("failed to read CA bundle: %w", err)
 	}
@@ -280,7 +280,7 @@ func updateCABundleConfigMap(t *testing.T, targetNS string) error {
 		return fmt.Errorf("failed to get project root: %w", err)
 	}
 
-	actualCABundle, err := os.ReadFile(filepath.Join(projectRoot, "config", "samples", "vllm-ca-certs", controllers.DefaultCABundleKey))
+	actualCABundle, err := os.ReadFile(filepath.Join(projectRoot, "config", "samples", "tls-test-certs", "ca-bundle", controllers.DefaultCABundleKey))
 	if err != nil {
 		return fmt.Errorf("failed to read CA bundle file: %w", err)
 	}
