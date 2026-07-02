@@ -132,22 +132,19 @@ except Exception as e:
 PORT=${OGX_PORT:-8321}
 WORKERS=${OGX_WORKERS:-1}
 
-# Build TLS or insecure flags
+# Build TLS flags for uvicorn when certs are provided by the operator
 TLS_FLAGS=""
-INSECURE_FLAG=""
 if [ -n "${OGX_TLS_CERTFILE:-}" ] && [ -n "${OGX_TLS_KEYFILE:-}" ]; then
     TLS_FLAGS="--ssl-certfile $OGX_TLS_CERTFILE --ssl-keyfile $OGX_TLS_KEYFILE"
-else
-    INSECURE_FLAG="--insecure"
 fi
 
 # Execute the appropriate CLI based on version
 case $VERSION_CODE in
-    0) python3 -m ogx.distribution.server.server --config /etc/ogx/config.yaml $INSECURE_FLAG ;;
-    1) python3 -m ogx.core.server.server /etc/ogx/config.yaml $INSECURE_FLAG ;;
-    2) exec uvicorn ogx.core.server.server:create_app --host 0.0.0.0 --port "$PORT" --workers "$WORKERS" --factory $TLS_FLAGS $INSECURE_FLAG ;;
+    0) python3 -m ogx.distribution.server.server --config /etc/ogx/config.yaml ;;
+    1) python3 -m ogx.core.server.server /etc/ogx/config.yaml ;;
+    2) exec uvicorn ogx.core.server.server:create_app --host 0.0.0.0 --port "$PORT" --workers "$WORKERS" --factory $TLS_FLAGS ;;
     *) echo "Invalid version code: $VERSION_CODE, using uvicorn CLI command"; \
-       exec uvicorn ogx.core.server.server:create_app --host 0.0.0.0 --port "$PORT" --workers "$WORKERS" --factory $TLS_FLAGS $INSECURE_FLAG ;;
+       exec uvicorn ogx.core.server.server:create_app --host 0.0.0.0 --port "$PORT" --workers "$WORKERS" --factory $TLS_FLAGS ;;
 esac`
 
 const ogxConfigPath = "/etc/ogx/config.yaml"
